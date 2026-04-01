@@ -1,0 +1,127 @@
+# =============================================================================
+# Haven Daemon — systemd Unit File
+# =============================================================================
+#
+# This file tells systemd how to manage the Haven daemon as a Linux service.
+# It handles starting, stopping, crash recovery, and boot persistence.
+#
+# Installation:
+#   sudo cp haven-daemon.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable haven-daemon
+#   sudo systemctl start haven-daemon
+#
+# Management:
+#   sudo systemctl status haven-daemon       # Check status
+#   sudo systemctl restart haven-daemon      # Restart (e.g., after git pull)
+#   sudo journalctl -u haven-daemon -f       # Follow logs in real time
+#   sudo journalctl -u haven-daemon -n 100   # Last 100 log lines
+#
+# =============================================================================
+
+[Unit]
+# Human-readable description — shown in `systemctl status` output
+Description=Haven Daemon - Crypto Intelligence Pipeline (34 async loops)
+
+# Wait for networking before starting. Haven needs outbound HTTPS to reach
+# Telegram, CoinGecko, DexScreener, Helius, CryptoPanic, and ~40 other APIs.
+# Without this, the daemon could start before DNS resolution works.
+After=network.target
+
+[Service]
+# --- Process Type ---
+# "simple" = systemd considers the service started as soon as ExecStart runs.
+# This is correct for long-running processes that stay in the foreground.
+# Use "forking" only if the process double-forks (Haven does not).
+Type=simple
+
+# --- User ---
+# Run as ubuntu, never root. The daemon reads config files, writes to SQLite,
+# and makes HTTPS requests — none of which require root privileges.
+# If the process is compromised, the blast radius is limited to ubuntu's
+# permissions, not full system access.
+User=ubuntu
+
+# --- Working Directory ---
+# Haven reads config/settings.yaml and writes to data/haven.db using relative
+# paths. This ensures those paths resolve correctly.
+WorkingDirectory=/home/ubuntu/haven
+
+# --- The Command ---
+# Points directly at the Python binary inside Poetry's virtualenv.
+#
+# Why not "poetry run python ..."?
+#   1. Poetry's shim may not be on the PATH for systemd's environment
+#   2. "poetry run" adds ~2 seconds of startup overhead (resolves deps)
+#   3. Direct path is explicit — no ambiguity about which Python runs
+#
+# The "start" argument is REQUIRED. haven_daemon.py uses argparse with
+# choices=["start", "status", "stop"]. Omitting it produces:
+#   error: the following arguments are required: command
+# This was our first gotcha — the service crash-looped 5 times before
+# hitting StartLimitBurst and going to "failed" state.
+ExecStart=/home/ubuntu/.cache/pypoetry/virtualenvs/project-haven-Q6auRe72-py3.12/bin/python -m src.automation.haven_daemon start
+
+# --- Restart Policy ---
+# "always" = restart on ANY exit — clean (exit 0), crash (exit 1), signal kill.
+# For a 24/7 data pipeline, this is the correct policy. We never want the
+# daemon to stay down voluntarily.
+#
+# Alternatives:
+#   on-failure  = restart only on non-zero exit / signal kill (not exit 0)
+#   on-abnormal = restart only on signal kill / timeout / watchdog
+#   no          = never restart (defeats the purpose for us)
+Restart=always
+
+# Wait 10 seconds before restarting after a crash. This prevents:
+#   - Rapid crash-looping if the error is persistent (e.g., DB locked)
+#   - Hammering rate-limited APIs immediately after a network timeout
+#   - SQLite WAL corruption from rapid start/stop cycles
+RestartSec=10
+
+# --- Stop Behavior ---
+# When systemd sends SIGTERM (via `systemctl stop`), how long to wait before
+# escalating to SIGKILL.
+#
+# Default is 90 seconds — way too long for a deploy workflow where you do
+# `git pull && systemctl restart`. You'd wait 90 seconds on every deploy.
+#
+# Haven's asyncio loops need ~5-15 seconds to drain in-flight operations.
+# 30 seconds is generous. After that, SIGKILL is the right call — any
+# in-flight SQLite writes will be recovered via WAL replay on next start.
+TimeoutStopSec=30
+
+# --- Environment ---
+# PYTHONUNBUFFERED=1 is critical. Without it, Python buffers stdout in 8KB
+# chunks. This means:
+#   - Log lines arrive in journald in delayed bursts, not in real time
+#   - If the process crashes, buffered log lines are LOST — you can't see
+#     what happened right before the crash
+#   - `journalctl -f` shows nothing for minutes, then dumps 50 lines at once
+#
+# One environment variable fixes all of this. Always set it for Python services.
+Environment=PYTHONUNBUFFERED=1
+
+# --- Logging ---
+# Route stdout and stderr to journald. This replaces manual log file management:
+#   - No more `>> /var/log/haven.log 2>&1`
+#   - No more log rotation scripts
+#   - No more disk-full incidents from unbounded log files
+#   - journald handles retention and disk limits automatically
+#
+# SyslogIdentifier sets the tag used in `journalctl -u haven-daemon`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=haven-daemon
+
+[Install]
+# WantedBy=multi-user.target means: start this service when the system
+# reaches normal multi-user mode (i.e., a standard boot without GUI).
+#
+# When you run `systemctl enable haven-daemon`, systemd creates a symlink:
+#   /etc/systemd/system/multi-user.target.wants/haven-daemon.service
+#     → /etc/systemd/system/haven-daemon.service
+#
+# On boot, systemd reads multi-user.target.wants/ and starts everything
+# linked there. This is how "enable" makes services persistent across reboots.
+WantedBy=multi-user.target
